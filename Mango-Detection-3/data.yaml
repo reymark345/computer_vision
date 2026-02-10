@@ -1,0 +1,8 @@
+path: /c/laragon/www/computer_vision/Mango-Detection-3
+train: train/images
+val: valid/images
+test: test/images
+
+names:
+  0: mango
+  1: occluded
