@@ -1,36 +1,46 @@
 import os
 import glob
+import csv
 import cv2
 import numpy as np
 
-# ======================================================
-# PATHS (relative to where THIS FILE lives)
-# ======================================================
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-IMAGES_DIR = "Mango-Detection-3/train/images"
-LABELS_DIR = "Mango-Detection-3/train/labels"
-OUT_DIR = "Mango-Detection-3/mango_crops_train"
+IMAGES_DIR = "Mango-Detection-5/train/images"
+LABELS_DIR = "Mango-Detection-5/train/labels"
+OUT_DIR = "Mango-Detection-5/mango_crops_train"
+REJECT_DIR = "Mango-Detection-5/mango_crops_train_reject"
+
+PADDING = 10
+KEEP_TRANSPARENT_BG = True
+MAX_SIZE = None
 
 # ======================================================
-# SETTINGS
+# QUALITY THRESHOLDS
 # ======================================================
-PADDING = 10                 # extra pixels around the mango bbox
-KEEP_TRANSPARENT_BG = True   # True => PNG with alpha, False => JPG on white bg
+MIN_CROP_SIDE = 40              # reject very narrow/small crops
+MIN_MANGO_PIXELS = 800          # reject tiny visible mango fragments
 
-# If you want absolutely NO resizing at all, set MAX_SIZE = None
-# If you want to avoid extremely huge outputs, set MAX_SIZE = 1024 (downscale only)
-MAX_SIZE = None  # e.g. 1024, or None
+MAX_OCCLUDED_RATIO = 0.80       # reject if occluded ratio >= 80%
+MAX_SHADOW_RATIO = 0.60         # reject if shadow ratio >= 60%
+
+SHADOW_PERCENTILE = 30          # adaptive threshold percentile from fruit luminance
+MIN_SHADOW_COMPONENT_AREA = 0.03  # keep only larger dark connected regions
+MIN_SHADOW_STRENGTH = 12.0      # reject only if shadow is also meaningfully dark
+
+# NEW: reject globally dark fruits even if relative shadow contrast is low
+MIN_GLOBAL_BRIGHTNESS = 60.0    # tune experimentally
 
 os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(REJECT_DIR, exist_ok=True)
 
-# ======================================================
-# HELPERS
-# ======================================================
+CSV_PATH = os.path.join(OUT_DIR, "crop_quality_metrics.csv")
+
+
 def parse_poly_line(line, img_w, img_h):
     """
     YOLOv8-seg polygon format:
-    class x1 y1 x2 y2 ... xn yn   (normalized)
+    class x1 y1 x2 y2 ... xn yn  (normalized)
     """
     parts = line.strip().split()
     cls = int(float(parts[0]))
@@ -43,14 +53,18 @@ def parse_poly_line(line, img_w, img_h):
     for i in range(0, len(coords), 2):
         x = int(round(coords[i] * img_w))
         y = int(round(coords[i + 1] * img_h))
+        x = max(0, min(img_w - 1, x))
+        y = max(0, min(img_h - 1, y))
         pts.append([x, y])
 
     return cls, np.array(pts, dtype=np.int32)
+
 
 def polygon_to_mask(poly, w, h):
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(mask, [poly], 255)
     return mask
+
 
 def pad_to_square(img, border_val):
     h, w = img.shape[:2]
@@ -64,21 +78,117 @@ def pad_to_square(img, border_val):
         cv2.BORDER_CONSTANT, value=border_val
     )
 
+
 def downscale_only(img, max_size):
-    """
-    Downscale only (never upscale). Assumes square input.
-    """
     if max_size is None:
         return img
     h, w = img.shape[:2]
-    if h <= max_size:
+    if max(h, w) <= max_size:
         return img
-    return cv2.resize(img, (max_size, max_size), interpolation=cv2.INTER_AREA)
 
-# ======================================================
-# MAIN
-# ======================================================
+    scale = max_size / max(h, w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+
+def compute_shadow_metrics_lab(crop_bgr, crop_mask, shadow_percentile=30):
+    """
+    Compute shadow only inside the mango region using LAB L channel.
+
+    Returns:
+        shadow_ratio
+        mean_L_fruit
+        mean_L_shadow
+        shadow_strength
+        std_L_fruit
+        adaptive_threshold
+    """
+    mango_region = crop_mask > 0
+    mango_pixels_count = int(np.count_nonzero(mango_region))
+
+    if mango_pixels_count == 0:
+        return 1.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+
+    L_fruit = L[mango_region]
+    mean_L_fruit = float(np.mean(L_fruit))
+    std_L_fruit = float(np.std(L_fruit))
+
+    # Adaptive threshold based only on the fruit luminance distribution
+    adaptive_threshold = float(np.percentile(L_fruit, shadow_percentile))
+
+    dark_mask = np.zeros_like(crop_mask, dtype=np.uint8)
+    dark_mask[(L < adaptive_threshold) & mango_region] = 255
+
+    # Remove tiny dark regions so small disease spots/speckles are less likely
+    # to be counted as dominant shadow.
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
+    filtered_dark_mask = np.zeros_like(dark_mask)
+
+    min_component_pixels = max(1, int(mango_pixels_count * MIN_SHADOW_COMPONENT_AREA))
+
+    for label_idx in range(1, num_labels):
+        area = stats[label_idx, cv2.CC_STAT_AREA]
+        if area >= min_component_pixels:
+            filtered_dark_mask[labels == label_idx] = 255
+
+    shadow_pixels = int(np.count_nonzero(filtered_dark_mask))
+    shadow_ratio = shadow_pixels / mango_pixels_count
+
+    shadow_region = filtered_dark_mask > 0
+    if np.any(shadow_region):
+        mean_L_shadow = float(np.mean(L[shadow_region]))
+        shadow_strength = mean_L_fruit - mean_L_shadow
+    else:
+        mean_L_shadow = 0.0
+        shadow_strength = 0.0
+
+    return (
+        shadow_ratio,
+        mean_L_fruit,
+        mean_L_shadow,
+        shadow_strength,
+        std_L_fruit,
+        adaptive_threshold
+    )
+
+
+def classify_quality(
+    visible_ratio,
+    shadow_ratio,
+    shadow_strength,
+    crop_w,
+    crop_h,
+    mango_area,
+    mean_L_fruit
+):
+    occluded_ratio = 1.0 - visible_ratio
+
+    # Reject tiny crops or tiny visible mango fragments
+    if min(crop_w, crop_h) < MIN_CROP_SIDE or mango_area < MIN_MANGO_PIXELS:
+        return "REJECT"
+
+    # Reject if effective occlusion is 80% or more
+    if occluded_ratio >= MAX_OCCLUDED_RATIO:
+        return "REJECT"
+
+    # NEW: reject globally dark images
+    if mean_L_fruit < MIN_GLOBAL_BRIGHTNESS:
+        return "REJECT"
+
+    # Reject if shadow is 60% or more and actually strong/dark
+    if shadow_ratio >= MAX_SHADOW_RATIO and shadow_strength >= MIN_SHADOW_STRENGTH:
+        return "REJECT"
+
+    return "ACCEPT"
+
+
 saved = 0
+rows = []
+
 img_paths = sorted(glob.glob(os.path.join(IMAGES_DIR, "*.*")))
 
 for img_path in img_paths:
@@ -112,7 +222,6 @@ for img_path in img_paths:
         x1, x2 = xs.min(), xs.max() + 1
         y1, y2 = ys.min(), ys.max() + 1
 
-        # padding around bbox
         x1 = max(0, x1 - PADDING)
         y1 = max(0, y1 - PADDING)
         x2 = min(w, x2 + PADDING)
@@ -121,30 +230,102 @@ for img_path in img_paths:
         crop = img[y1:y2, x1:x2]
         crop_mask = mask[y1:y2, x1:x2]
 
+        mango_area = int(np.count_nonzero(crop_mask))
+        bbox_area = int(crop_mask.shape[0] * crop_mask.shape[1])
+
+        visible_ratio = mango_area / bbox_area if bbox_area > 0 else 0.0
+        occluded_ratio = 1.0 - visible_ratio
+
+        (
+            shadow_ratio,
+            mean_L_fruit,
+            mean_L_shadow,
+            shadow_strength,
+            std_L_fruit,
+            adaptive_threshold
+        ) = compute_shadow_metrics_lab(
+            crop,
+            crop_mask,
+            shadow_percentile=SHADOW_PERCENTILE
+        )
+
+        crop_h, crop_w = crop.shape[:2]
+        quality = classify_quality(
+            visible_ratio,
+            shadow_ratio,
+            shadow_strength,
+            crop_w,
+            crop_h,
+            mango_area,
+            mean_L_fruit
+        )
+
         if KEEP_TRANSPARENT_BG:
-            # RGBA with alpha from mask (no background)
             crop_out = cv2.cvtColor(crop, cv2.COLOR_BGR2BGRA)
             crop_out[:, :, 3] = crop_mask
             border_val = (0, 0, 0, 0)
             ext = "png"
         else:
-            # White background RGB (often better for experts)
             white_bg = np.ones_like(crop, dtype=np.uint8) * 255
             crop_out = np.where(crop_mask[..., None] > 0, crop, white_bg)
             border_val = (255, 255, 255)
             ext = "jpg"
 
-        # Pad to square (NO resizing yet)
         crop_sq = pad_to_square(crop_out, border_val)
-
-        # Optional downscale only (never upscale)
         out_img = downscale_only(crop_sq, MAX_SIZE)
 
         out_name = f"{base}_cls{cls}_id{inst:03d}.{ext}"
-        cv2.imwrite(os.path.join(OUT_DIR, out_name), out_img)
+        out_root = REJECT_DIR if quality == "REJECT" else OUT_DIR
+        out_path = os.path.join(out_root, out_name)
+        cv2.imwrite(out_path, out_img)
+
+        rows.append([
+            out_name,
+            base,
+            cls,
+            inst,
+            crop_w,
+            crop_h,
+            mango_area,
+            bbox_area,
+            round(visible_ratio, 4),
+            round(occluded_ratio, 4),
+            round(shadow_ratio, 4),
+            round(mean_L_fruit, 2),
+            round(mean_L_shadow, 2),
+            round(shadow_strength, 2),
+            round(std_L_fruit, 2),
+            round(adaptive_threshold, 2),
+            quality
+        ])
 
         inst += 1
         saved += 1
 
-print(f"✅ Done. Saved {saved} mango crops into: {OUT_DIR}")
-print("Note: No filtering. No upscaling. Only padding; optional downscale if MAX_SIZE is set.")
+with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "crop_name",
+        "source_image",
+        "class_id",
+        "instance_id",
+        "crop_width",
+        "crop_height",
+        "mango_area",
+        "bbox_area",
+        "visible_ratio",
+        "occluded_ratio",
+        "shadow_ratio",
+        "mean_L_fruit",
+        "mean_L_shadow",
+        "shadow_strength",
+        "std_L_fruit",
+        "adaptive_threshold",
+        "quality"
+    ])
+    writer.writerows(rows)
+
+print(f"Done. Saved {saved} mango crops.")
+print(f"Accepted crops folder: {OUT_DIR}")
+print(f"Rejected crops folder: {REJECT_DIR}")
+print(f"Saved metrics CSV: {CSV_PATH}")

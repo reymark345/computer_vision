@@ -11,14 +11,14 @@ from ultralytics import YOLO
 WEIGHTS_PATH = (
     Path(__file__).resolve().parent
     / "models"
-    / "mango_seg"
+    / "mango_seg_fresh3"
     / "weights"
     / "best.pt"
 )
 
 # Path to the input image you want to run on
 IMAGE_PATH = Path(
-    r"C:\laragon\www\computer_vision\Mango-Detection-4\based_path\image2.jpg"
+    r"C:\laragon\www\computer_vision\Mango-Detection-4\based_path\image6.jpg"
 )
 
 # Folder + filename for saving the output image
@@ -29,7 +29,7 @@ OUTPUT_IMAGE_NAME = "mango_result.jpg"
 SHOW_WINDOW = False
 
 # Confidence threshold for detections (lower to pick up more mangoes)
-CONF_THRESHOLD = 0.2
+CONF_THRESHOLD = 0.6
 
 # NMS IoU threshold (higher = keep more overlapping detections)
 IOU_THRESHOLD = 0.8
@@ -38,7 +38,7 @@ IOU_THRESHOLD = 0.8
 MAX_DET = 300
 
 # If True, apply class-agnostic NMS (can help when classes overlap)
-AGNOSTIC_NMS = True
+AGNOSTIC_NMS = False
 
 # Detection mode:
 # - "non_occluded_only": show only class 0 (mango)
@@ -162,6 +162,18 @@ def run_on_image(weights: Path, source: Path, conf: float, save_path: Optional[P
         classes=classes,
         verbose=False,
     )
+
+    if results and results[0].boxes is not None and len(results[0].boxes) > 0:
+        boxes = results[0].boxes
+        cls_ids = boxes.cls.cpu().numpy().astype(int).tolist()
+        mango_count = sum(1 for c in cls_ids if c == 0)
+        occluded_count = sum(1 for c in cls_ids if c == 1)
+        print(
+            f"Detections: total={len(cls_ids)} | mango={mango_count} | occluded={occluded_count}"
+        )
+    else:
+        print(f"No detections found at conf={conf}. Try lowering CONF_THRESHOLD.")
+
     if results:
         vis_frame = visualize_segmentation(frame, results[0])
     else:
