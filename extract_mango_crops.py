@@ -8,39 +8,43 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 IMAGES_DIR = "Mango-Detection-5/train/images"
 LABELS_DIR = "Mango-Detection-5/train/labels"
-OUT_DIR = "Mango-Detection-5/mango_crops_train"
-REJECT_DIR = "Mango-Detection-5/mango_crops_train_reject"
+OUT_DIR = "Mango-Detection-5/mango_crops_train_by_occlusion"
 
 PADDING = 10
 KEEP_TRANSPARENT_BG = True
 MAX_SIZE = None
 
 # ======================================================
-# QUALITY THRESHOLDS
+# EXPERIMENTAL QUALITY THRESHOLDS
 # ======================================================
-MIN_CROP_SIDE = 40              # reject very narrow/small crops
-MIN_MANGO_PIXELS = 800          # reject tiny visible mango fragments
+MIN_CROP_SIDE = 40
+MIN_MANGO_PIXELS = 800
 
-MAX_OCCLUDED_RATIO = 0.80       # reject if occluded ratio >= 80%
-MAX_SHADOW_RATIO = 0.60         # reject if shadow ratio >= 60%
+MAX_OCCLUDED_RATIO = 0.80      # reject only if > 80%
+MAX_SHADOW_RATIO = 0.60        # reject if >= 60%
 
-SHADOW_PERCENTILE = 30          # adaptive threshold percentile from fruit luminance
-MIN_SHADOW_COMPONENT_AREA = 0.03  # keep only larger dark connected regions
-MIN_SHADOW_STRENGTH = 12.0      # reject only if shadow is also meaningfully dark
-
-# NEW: reject globally dark fruits even if relative shadow contrast is low
-MIN_GLOBAL_BRIGHTNESS = 60.0    # tune experimentally
+SHADOW_PERCENTILE = 25         # adaptive threshold from mango luminance
+MIN_SHADOW_COMPONENT_AREA = 0.05  # only keep larger dark regions
 
 os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(REJECT_DIR, exist_ok=True)
 
-CSV_PATH = os.path.join(OUT_DIR, "crop_quality_metrics.csv")
+OCCLUSION_DIRS = {
+    "0_10": os.path.join(OUT_DIR, "0_10"),
+    "10_40": os.path.join(OUT_DIR, "10_40"),
+    "40_80": os.path.join(OUT_DIR, "40_80"),
+    "80_above": os.path.join(OUT_DIR, "80_above"),
+}
+
+for folder in OCCLUSION_DIRS.values():
+    os.makedirs(folder, exist_ok=True)
+
+CSV_PATH = os.path.join(OUT_DIR, "crop_quality_metrics_experiment_simple.csv")
 
 
 def parse_poly_line(line, img_w, img_h):
     """
     YOLOv8-seg polygon format:
-    class x1 y1 x2 y2 ... xn yn  (normalized)
+    class x1 y1 x2 y2 ... xn yn (normalized)
     """
     parts = line.strip().split()
     cls = int(float(parts[0]))
@@ -66,6 +70,67 @@ def polygon_to_mask(poly, w, h):
     return mask
 
 
+def estimate_occlusion_ratio_from_mask(crop_mask):
+    """
+    Estimate how much of the mango is missing by comparing the visible mask
+    area to an ellipse fitted to the mango contour. This is more faithful than
+    comparing against the crop rectangle, which overestimates occlusion for
+    naturally oval fruit shapes.
+    """
+    contour_points = cv2.findNonZero(crop_mask)
+    visible_area = int(np.count_nonzero(crop_mask))
+
+    if contour_points is None or visible_area == 0:
+        return 1.0, visible_area, 0.0
+
+    contour_points = contour_points.reshape(-1, 2)
+
+    if len(contour_points) >= 5:
+        ellipse = cv2.fitEllipse(contour_points)
+        (_, _), (axis_w, axis_h), _ = ellipse
+        estimated_full_area = float(np.pi * (axis_w * 0.5) * (axis_h * 0.5))
+    else:
+        x, y, w, h = cv2.boundingRect(contour_points)
+        estimated_full_area = float(np.pi * (w * 0.5) * (h * 0.5))
+
+    estimated_full_area = max(float(visible_area), estimated_full_area)
+    visible_ratio = min(1.0, visible_area / estimated_full_area)
+    occluded_ratio = max(0.0, 1.0 - visible_ratio)
+
+    return occluded_ratio, visible_area, estimated_full_area
+
+
+def compute_shape_completeness_metrics(crop_mask):
+    """
+    Extra shape checks to keep obviously cut fragments out of the 0%-10% bin.
+    """
+    contour_points = cv2.findNonZero(crop_mask)
+    if contour_points is None:
+        return 0.0, 0.0, 4, 0.0
+
+    contour = cv2.convexHull(contour_points)
+    hull_area = float(cv2.contourArea(contour))
+    visible_area = float(np.count_nonzero(crop_mask))
+    bbox_h, bbox_w = crop_mask.shape[:2]
+    bbox_area = float(bbox_h * bbox_w) if bbox_h > 0 and bbox_w > 0 else 0.0
+
+    solidity = visible_area / hull_area if hull_area > 0 else 0.0
+    extent = visible_area / bbox_area if bbox_area > 0 else 0.0
+    aspect_ratio = max(bbox_w, bbox_h) / max(1.0, min(bbox_w, bbox_h))
+
+    touches = 0
+    if np.any(crop_mask[0, :] > 0):
+        touches += 1
+    if np.any(crop_mask[-1, :] > 0):
+        touches += 1
+    if np.any(crop_mask[:, 0] > 0):
+        touches += 1
+    if np.any(crop_mask[:, -1] > 0):
+        touches += 1
+
+    return solidity, extent, touches, aspect_ratio
+
+
 def pad_to_square(img, border_val):
     h, w = img.shape[:2]
     side = max(h, w)
@@ -82,6 +147,7 @@ def pad_to_square(img, border_val):
 def downscale_only(img, max_size):
     if max_size is None:
         return img
+
     h, w = img.shape[:2]
     if max(h, w) <= max_size:
         return img
@@ -92,40 +158,41 @@ def downscale_only(img, max_size):
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
-def compute_shadow_metrics_lab(crop_bgr, crop_mask, shadow_percentile=30):
+def compute_shadow_ratio_lab(crop_bgr, crop_mask, shadow_percentile=25):
     """
-    Compute shadow only inside the mango region using LAB L channel.
+    Compute shadow ratio only inside the mango region using LAB L channel.
 
-    Returns:
-        shadow_ratio
-        mean_L_fruit
-        mean_L_shadow
-        shadow_strength
-        std_L_fruit
-        adaptive_threshold
+    This simplified experimental version:
+    - uses blurred luminance
+    - uses adaptive threshold
+    - removes small dark regions
+    - returns shadow_ratio only + supporting values for inspection
     """
     mango_region = crop_mask > 0
     mango_pixels_count = int(np.count_nonzero(mango_region))
 
     if mango_pixels_count == 0:
-        return 1.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 1.0, 0.0, 0.0, 0.0
 
     lab = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2LAB)
     L = lab[:, :, 0].astype(np.float32)
 
-    L_fruit = L[mango_region]
+    # Blur to emphasize broad shadows and suppress tiny dark disease spots
+    L_blur = cv2.GaussianBlur(L, (21, 21), 0)
+
+    L_fruit = L_blur[mango_region]
     mean_L_fruit = float(np.mean(L_fruit))
     std_L_fruit = float(np.std(L_fruit))
 
-    # Adaptive threshold based only on the fruit luminance distribution
     adaptive_threshold = float(np.percentile(L_fruit, shadow_percentile))
 
     dark_mask = np.zeros_like(crop_mask, dtype=np.uint8)
-    dark_mask[(L < adaptive_threshold) & mango_region] = 255
+    dark_mask[(L_blur < adaptive_threshold) & mango_region] = 255
 
-    # Remove tiny dark regions so small disease spots/speckles are less likely
-    # to be counted as dominant shadow.
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
+    # Keep only larger dark connected regions
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dark_mask, connectivity=8
+    )
     filtered_dark_mask = np.zeros_like(dark_mask)
 
     min_component_pixels = max(1, int(mango_pixels_count * MIN_SHADOW_COMPONENT_AREA))
@@ -138,52 +205,59 @@ def compute_shadow_metrics_lab(crop_bgr, crop_mask, shadow_percentile=30):
     shadow_pixels = int(np.count_nonzero(filtered_dark_mask))
     shadow_ratio = shadow_pixels / mango_pixels_count
 
-    shadow_region = filtered_dark_mask > 0
-    if np.any(shadow_region):
-        mean_L_shadow = float(np.mean(L[shadow_region]))
-        shadow_strength = mean_L_fruit - mean_L_shadow
-    else:
-        mean_L_shadow = 0.0
-        shadow_strength = 0.0
-
-    return (
-        shadow_ratio,
-        mean_L_fruit,
-        mean_L_shadow,
-        shadow_strength,
-        std_L_fruit,
-        adaptive_threshold
-    )
+    return shadow_ratio, mean_L_fruit, std_L_fruit, adaptive_threshold
 
 
-def classify_quality(
-    visible_ratio,
-    shadow_ratio,
-    shadow_strength,
-    crop_w,
-    crop_h,
-    mango_area,
-    mean_L_fruit
-):
+def classify_quality(visible_ratio, shadow_ratio, crop_w, crop_h, mango_area):
     occluded_ratio = 1.0 - visible_ratio
 
-    # Reject tiny crops or tiny visible mango fragments
+    # Reject tiny crops or tiny visible fragments
     if min(crop_w, crop_h) < MIN_CROP_SIDE or mango_area < MIN_MANGO_PIXELS:
         return "REJECT"
 
-    # Reject if effective occlusion is 80% or more
-    if occluded_ratio >= MAX_OCCLUDED_RATIO:
+    # Reject only if occlusion is greater than 80%
+    if occluded_ratio > MAX_OCCLUDED_RATIO:
         return "REJECT"
 
-    # NEW: reject globally dark images
-    if mean_L_fruit < MIN_GLOBAL_BRIGHTNESS:
-        return "REJECT"
-
-    # Reject if shadow is 60% or more and actually strong/dark
-    if shadow_ratio >= MAX_SHADOW_RATIO and shadow_strength >= MIN_SHADOW_STRENGTH:
+    # Reject if shadow is 60% or more
+    if shadow_ratio >= MAX_SHADOW_RATIO:
         return "REJECT"
 
     return "ACCEPT"
+
+
+def get_occlusion_bucket(
+    occluded_ratio,
+    crop_w,
+    crop_h,
+    mango_area,
+    solidity,
+    extent,
+    border_touches,
+    aspect_ratio
+):
+    """
+    Occlusion bands based on the reference:
+    - minimal / nearly fully visible: 0%-10%
+    - low occlusion: 10%-40%
+    - moderate occlusion: 40%-80%
+    - strong occlusion: >80%
+    """
+    if min(crop_w, crop_h) < MIN_CROP_SIDE or mango_area < MIN_MANGO_PIXELS:
+        return "80_above"
+    if (
+        occluded_ratio < 0.05
+        and solidity >= 0.94
+        and extent >= 0.58
+        and border_touches == 0
+        and aspect_ratio <= 2.35
+    ):
+        return "0_10"
+    if occluded_ratio < 0.40:
+        return "10_40"
+    if occluded_ratio < 0.80:
+        return "40_80"
+    return "80_above"
 
 
 saved = 0
@@ -230,20 +304,13 @@ for img_path in img_paths:
         crop = img[y1:y2, x1:x2]
         crop_mask = mask[y1:y2, x1:x2]
 
-        mango_area = int(np.count_nonzero(crop_mask))
+        occluded_ratio, mango_area, estimated_full_area = estimate_occlusion_ratio_from_mask(crop_mask)
+        solidity, extent, border_touches, aspect_ratio = compute_shape_completeness_metrics(crop_mask)
         bbox_area = int(crop_mask.shape[0] * crop_mask.shape[1])
 
-        visible_ratio = mango_area / bbox_area if bbox_area > 0 else 0.0
-        occluded_ratio = 1.0 - visible_ratio
+        visible_ratio = 1.0 - occluded_ratio
 
-        (
-            shadow_ratio,
-            mean_L_fruit,
-            mean_L_shadow,
-            shadow_strength,
-            std_L_fruit,
-            adaptive_threshold
-        ) = compute_shadow_metrics_lab(
+        shadow_ratio, mean_L_fruit, std_L_fruit, adaptive_threshold = compute_shadow_ratio_lab(
             crop,
             crop_mask,
             shadow_percentile=SHADOW_PERCENTILE
@@ -253,11 +320,19 @@ for img_path in img_paths:
         quality = classify_quality(
             visible_ratio,
             shadow_ratio,
-            shadow_strength,
+            crop_w,
+            crop_h,
+            mango_area
+        )
+        occlusion_bucket = get_occlusion_bucket(
+            occluded_ratio,
             crop_w,
             crop_h,
             mango_area,
-            mean_L_fruit
+            solidity,
+            extent,
+            border_touches,
+            aspect_ratio
         )
 
         if KEEP_TRANSPARENT_BG:
@@ -275,7 +350,7 @@ for img_path in img_paths:
         out_img = downscale_only(crop_sq, MAX_SIZE)
 
         out_name = f"{base}_cls{cls}_id{inst:03d}.{ext}"
-        out_root = REJECT_DIR if quality == "REJECT" else OUT_DIR
+        out_root = OCCLUSION_DIRS[occlusion_bucket]
         out_path = os.path.join(out_root, out_name)
         cv2.imwrite(out_path, out_img)
 
@@ -288,12 +363,17 @@ for img_path in img_paths:
             crop_h,
             mango_area,
             bbox_area,
+            round(estimated_full_area, 2),
             round(visible_ratio, 4),
             round(occluded_ratio, 4),
+            round(occluded_ratio * 100.0, 2),
+            round(solidity, 4),
+            round(extent, 4),
+            border_touches,
+            round(aspect_ratio, 4),
+            occlusion_bucket,
             round(shadow_ratio, 4),
             round(mean_L_fruit, 2),
-            round(mean_L_shadow, 2),
-            round(shadow_strength, 2),
             round(std_L_fruit, 2),
             round(adaptive_threshold, 2),
             quality
@@ -313,12 +393,17 @@ with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
         "crop_height",
         "mango_area",
         "bbox_area",
+        "estimated_full_area",
         "visible_ratio",
         "occluded_ratio",
+        "occluded_percent",
+        "solidity",
+        "extent",
+        "border_touches",
+        "aspect_ratio",
+        "occlusion_bucket",
         "shadow_ratio",
         "mean_L_fruit",
-        "mean_L_shadow",
-        "shadow_strength",
         "std_L_fruit",
         "adaptive_threshold",
         "quality"
@@ -326,6 +411,6 @@ with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
     writer.writerows(rows)
 
 print(f"Done. Saved {saved} mango crops.")
-print(f"Accepted crops folder: {OUT_DIR}")
-print(f"Rejected crops folder: {REJECT_DIR}")
+for bucket_name, folder_path in OCCLUSION_DIRS.items():
+    print(f"{bucket_name} folder: {folder_path}")
 print(f"Saved metrics CSV: {CSV_PATH}")
