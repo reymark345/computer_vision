@@ -12,26 +12,6 @@ env/
 .vscode/
 .idea/
 
-# Outputs / generated files
-outputs/
-runs/
-results/
-*.log
-
-# Datasets / images / large files
-data/
-datasets/
-*.heic
-*.png
-*.jpg
-*.jpeg
-
-# Model weights
-*.pt
-*.pth
-*.onnx
-*.h5
-
 # Specific directories
 Mango-Detection-4/
 Mango-Detection-5/mango_crops_train_by_occlusion/
