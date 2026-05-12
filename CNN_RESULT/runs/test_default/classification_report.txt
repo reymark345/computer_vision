@@ -1,0 +1,10 @@
+              precision    recall  f1-score   support
+
+ Anthracnose     0.5957    0.7179    0.6512        39
+     Healthy     0.5294    0.4615    0.4932        39
+  Mango Scab     0.5926    0.4103    0.4848        39
+Stem end rot     0.5833    0.7179    0.6437        39
+
+    accuracy                         0.5769       156
+   macro avg     0.5753    0.5769    0.5682       156
+weighted avg     0.5753    0.5769    0.5682       156

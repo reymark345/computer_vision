@@ -16,16 +16,18 @@ KEEP_TRANSPARENT_BG = True
 MAX_SIZE = None
 
 # ======================================================
-# EXPERIMENTAL QUALITY THRESHOLDS
+# QUALITY THRESHOLDS
 # ======================================================
-MIN_CROP_SIDE = 40
-MIN_MANGO_PIXELS = 800
+MIN_CROP_SIDE = 40                 # reject very narrow/small crops
+MIN_MANGO_PIXELS = 800             # reject tiny visible mango fragments
 
-MAX_OCCLUDED_RATIO = 0.80      # reject only if > 80%
-MAX_SHADOW_RATIO = 0.60        # reject if >= 60%
+MAX_OCCLUDED_RATIO = 0.80          # reject only if occluded ratio > 80%
+MAX_SHADOW_RATIO = 0.60            # reject if shadow ratio >= 60%
 
-SHADOW_PERCENTILE = 25         # adaptive threshold from mango luminance
-MIN_SHADOW_COMPONENT_AREA = 0.05  # only keep larger dark regions
+SHADOW_PERCENTILE = 25             # adaptive threshold percentile from fruit luminance
+MIN_SHADOW_COMPONENT_AREA = 0.05   # only count larger dark regions as shadow
+MIN_SHADOW_STRENGTH = 12.0
+MIN_GLOBAL_BRIGHTNESS = 60.0       # reject only if global brightness is too low
 
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(REJECT_DIR, exist_ok=True)
@@ -139,7 +141,14 @@ def compute_shadow_ratio_lab(crop_bgr, crop_mask, shadow_percentile=25):
     return shadow_ratio, mean_L_fruit, std_L_fruit, adaptive_threshold
 
 
-def classify_quality(visible_ratio, shadow_ratio, crop_w, crop_h, mango_area):
+def classify_quality(
+    visible_ratio,
+    shadow_ratio,
+    shadow_strength,
+    crop_w,
+    crop_h,
+    mango_area
+):
     occluded_ratio = 1.0 - visible_ratio
 
     # Reject tiny crops or tiny visible fragments
