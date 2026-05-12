@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Environment/secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Specific directories
+conversion/heic/
+conversion/png/
+Mango-Detection-4/
+Mango-Detection-5/mango_crops_train_by_occlusion/
+CNN_RESULT/pipeline_outputs/
+CNN_RESULT/split_dataset/
