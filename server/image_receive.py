@@ -304,4 +304,5 @@ if __name__ == "__main__":
     print(f"Results saved to: {RESULTS_FOLDER}")
     print("=" * 50 + "\n")
 
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    # app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False, threaded=True)

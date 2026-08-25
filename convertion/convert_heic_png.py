@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -8,9 +10,44 @@ from pillow_heif import register_heif_opener
 
 
 HEIC_EXTENSIONS = {".heic", ".heif"}
+MAX_PNG_SIZE_BYTES = 20 * 1024 * 1024
+
+
+def save_png_with_size_limit(image: Image.Image, png_path: Path, max_size_bytes: int) -> int:
+    save_kwargs = {"format": "PNG", "optimize": True, "compress_level": 9}
+    current_image = image
+    width, height = current_image.size
+
+    while True:
+        with BytesIO() as buffer:
+            current_image.save(buffer, **save_kwargs)
+            contents = buffer.getvalue()
+
+        output_size = len(contents)
+        if output_size <= max_size_bytes:
+            png_path.write_bytes(contents)
+            return output_size
+
+        if width <= 64 or height <= 64:
+            png_path.write_bytes(contents)
+            return output_size
+
+        scale = math.sqrt(max_size_bytes / output_size) * 0.95
+        if scale >= 1.0:
+            scale = 0.95
+
+        new_width = max(1, int(width * scale))
+        new_height = max(1, int(height * scale))
+        if new_width == width and new_height == height:
+            new_width = max(1, width - 1)
+            new_height = max(1, height - 1)
+
+        current_image = current_image.resize((new_width, new_height), Image.LANCZOS)
+        width, height = current_image.size
 
 
 def convert_heic_to_png(source_dir: Path, output_dir: Path, overwrite: bool = False) -> tuple[int, int]:
+
     """Convert every HEIC/HEIF image in source_dir into PNG files in output_dir."""
     source_dir = source_dir.resolve()
     output_dir = output_dir.resolve()
@@ -40,9 +77,9 @@ def convert_heic_to_png(source_dir: Path, output_dir: Path, overwrite: bool = Fa
 
         with Image.open(heic_path) as image:
             image = ImageOps.exif_transpose(image)
-            image.save(png_path, "PNG")
+            output_size = save_png_with_size_limit(image, png_path, MAX_PNG_SIZE_BYTES)
 
-        print(f"Converted: {heic_path} -> {png_path}")
+        print(f"Converted: {heic_path} -> {png_path} ({output_size / 1024 / 1024:.2f} MB)")
         converted += 1
 
     return converted, skipped
