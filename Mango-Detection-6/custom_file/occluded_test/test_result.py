@@ -7,14 +7,14 @@ from ultralytics import YOLO
 
 
 WEIGHTS_PATH = (
-    Path(__file__).resolve().parent.parent
+    Path(__file__).resolve().parent.parent.parent
     / "models"
     / "mango_seg"
     / "weights"
     / "best.pt"
 )
 
-IMAGE_PATH = Path(__file__).resolve().parent / "based_path" / "image1.jpg"
+IMAGE_PATH = Path(__file__).resolve().parent / "based_path" / "image5.jpg"
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUT_IMAGE_NAME = "mango_result.jpg"
