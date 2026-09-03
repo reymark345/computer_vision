@@ -6,9 +6,9 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-IMAGES_DIR = "Mango-Detection-5/train/images"
-LABELS_DIR = "Mango-Detection-5/train/labels"
-OUT_DIR = "Mango-Detection-5/mango_crops_train_by_occlusion"
+IMAGES_DIR = "Mango-Detection-6/train/images"
+LABELS_DIR = "Mango-Detection-6/train/labels"
+OUT_DIR = "Mango-Detection-6/custom_file/crop_images/mango_crops_train_by_occlusion"
 
 PADDING = 10
 KEEP_TRANSPARENT_BG = True

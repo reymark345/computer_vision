@@ -15,6 +15,10 @@ env/
 conversion/heic/
 conversion/png/
 Mango-Detection-4/
-Mango-Detection-5/mango_crops_train_by_occlusion/
+Mango-Detection-5/
+Mango-Detection-5/
+Mango-Detection-6/custom_file/crop_images/
 CNN_RESULT/pipeline_outputs/
 CNN_RESULT/split_dataset/
+CNN_RESULT/convertion/heic/
+CNN_RESULT/convertion/png/
